@@ -13,36 +13,113 @@ It currently supports ragged batching decode and prefill attention with causal=1
 TO be added features:
 - Add GQA support
 - Misc
-    - N_CTX with non-integer number of BLOCK_N (pad zeros or add mask)
+    - N_CTX with non-integer number of BLOCK_SIZE_N (pad zeros or add mask)
     -
 """
 
 import torch
-
+import functools
+import json
+import aiter.ops.triton.utils.arch_info as arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from typing import Optional
+from bisect import bisect_right
 import triton
 import triton.language as tl
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
+
+LOG_TWO_E = 1.44269504  # log_2(e) value for softmax scaling
+# Support tensor in [B, Seqlen, H, d] format. Taking tensors in [B*Seqlen, H, d] as inputs
+
+
+@functools.lru_cache(maxsize=1024)
+def _get_config(
+    causal: bool,
+    batch_size: int,
+):
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-LEANATTN-DEFAULT.json"
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config._config_dict = config
+
+    config = _get_config._config_dict["any"]
+    return (
+        config.copy()
+    )  # return a copy to avoid mutation of stored config in LRU cache
+
+
+def persistent_lean_attention(
+    q: torch.Tensor,  # (B * seq_len_q, H, d)
+    k: torch.Tensor,  # (total_seq_len_k, H, d) -> supports ragged batching
+    v: torch.Tensor,  # (total_seq_len_k, H, d)
+    Mp: torch.Tensor,  # temp buffer to store partial max during sm
+    Lp: torch.Tensor,  # temp buffer to store partial se during sm
+    Op: torch.Tensor,  # (total_programs, n_ctx_q, d)
+    locks: torch.Tensor,  # (H, seq_len_q) -> used to synchronize blocks
+    batch_num_block_n: torch.Tensor,  # (B) -> cumulative sum of BLOCK_N
+    batch_size: int,
+    sm_scale: torch.float16,
+    causal: bool = True,  # causal masking
+    config: Optional[dict] = None,
+):
+    """
+    Lean Attention kernel.
+    """
+    _LOGGER.info(
+        f"LEAN_ATTEN_PAGED: q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)} Mp={tuple(Mp.shape)} Lp={tuple(Lp.shape)}  Op={tuple(Op.shape)}"
+    )
+    if config is None:
+        config = _get_config(causal=causal, batch_size=batch_size)
+    sm_count = arch_info.get_num_sms()
+
+    return _persistent_lean_attention(
+        q=q,
+        k=k,
+        v=v,
+        Mp=Mp,
+        Lp=Lp,
+        Op=Op,
+        locks=locks,
+        batch_num_block_n=batch_num_block_n,
+        total_programs=sm_count,
+        BLOCK_M=config["BLOCK_SIZE_M"],
+        BLOCK_N=config["BLOCK_SIZE_N"],
+        causal=causal,
+        batch_size=batch_size,
+        sm_scale=sm_scale,
+        num_warps=config["num_warps"],
+        waves_per_eu=config["waves_per_eu"],
+        config=config,
+    )
 
 
 # Support tensor in [B, Seqlen, H, d] format. Taking tensors in [B*Seqlen, H, d] as inputs
-def persistent_lean_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    Mp: torch.Tensor,
-    Lp: torch.Tensor,
-    Op: torch.Tensor,  # (total_programs, n_ctx_q, d)
-    locks: torch.Tensor,
-    batch_num_block_n: torch.Tensor,
-    total_programs: int,
-    BLOCK_M: int,
-    BLOCK_N: int,
-    causal: bool,
+def _persistent_lean_attention(
+    q: torch.Tensor,  # (B * seq_len_q, H, d)
+    k: torch.Tensor,  # (total_seq_len_k, H, d) -> supports ragged batching
+    v: torch.Tensor,  # (total_seq_len_k, H, d)
+    Mp: torch.Tensor,  # temp buffer to store partial max during sm
+    Lp: torch.Tensor,  # temp buffer to store partial se during sm
+    Op: torch.Tensor,  # (total_programs, n_ctx_q, d) -> stores partial output values
+    locks: torch.Tensor,  # (H, seq_len_q) -> used to synchronize blocks
+    batch_num_block_n: torch.Tensor,  # (B) -> cumulative sum of BLOCK_N for each item in the batch
+    total_programs: int,  # number of thread blocks (CTAs) to launch -> eq to num SMs
+    BLOCK_M: int,  # seq_q tile size
+    BLOCK_N: int,  # seq_k tile size
+    causal: bool,  # causal masking
     batch_size: int,
-    sm_scale: torch.float16,
+    sm_scale: torch.float16,  # typically 1 / sqrt(d)
     num_warps: int,
     waves_per_eu: int,
-    max_output_tile_cnt: int,
+    config: dict = {},
 ):
+    """
+    Inner kernel launching function.
+    """
     # shape constraints
     HEAD_DIM_Q, HEAD_DIM_K, HEAD_DIM_V = q.shape[-1], k.shape[-1], v.shape[-1]
     assert (
@@ -63,7 +140,7 @@ def persistent_lean_attention(
     N_CTX_K = k.shape[0]  # This is the sum of all ctx_n in a batch
     H = q.shape[1]
 
-    qk_scale = sm_scale * 1.44269504
+    qk_scale = sm_scale * LOG_TWO_E
 
     (
         num_m_blocks,
@@ -85,6 +162,7 @@ def persistent_lean_attention(
         BLOCK_N,
         total_programs,
     )
+
     # print(
     #    f"high_load_wgs={high_load_wgs}, max_tiles_per_wg={max_tiles_per_wg}, tiles_per_head={tiles_per_head}"
     # )
@@ -92,6 +170,21 @@ def persistent_lean_attention(
     #    f"total_programs={total_programs}, num_splits={num_splits}, even_split={even_split}"
     # )
     # print(f"num_m_blocks={num_m_blocks}, num_n_blocks={num_n_blocks}")
+
+    CAUSAL_MODE = 0  # 0:ping-pong, 1: sequential
+    max_output_tile_cnt = calculate_max_output_tiles_analytically(
+        tiles_per_head=tiles_per_head,
+        num_m_blocks=num_m_blocks,
+        num_wgs=total_programs,
+        high_load_wgs=high_load_wgs,
+        max_tiles_per_wg=max_tiles_per_wg,
+        causal=causal,
+        MASKED_BLOCKS=MASKED_BLOCKS,
+        MODE=CAUSAL_MODE,
+    )
+    # print(f"max_output_tile_cnt={max_output_tile_cnt}")
+
+    max_output_tile_cnt = max_output_tile_cnt + 4
 
     grid = (total_programs, 1, 1)
 
@@ -144,6 +237,7 @@ def persistent_lean_attention(
         causal=causal,
         num_m_blocks=num_m_blocks,
         num_n_blocks=num_n_blocks,
+        total_programs=total_programs,
         # leanAttention params
         high_load_wgs=high_load_wgs,
         max_tiles_per_wg=max_tiles_per_wg,
@@ -154,6 +248,7 @@ def persistent_lean_attention(
         num_warps=num_warps,
         num_stages=1,
         num_ctas=1,
+        **config,
     )
     """
     kernel_timing["attn_fwd"]["end_event"].record()
@@ -179,7 +274,10 @@ def get_num_splits_and_buffer_sizes(
     BLOCK_N,
     num_SMs,
 ):
-    ##### Lean Atteion: Calculate Splits and Tile Sizes #####
+    """
+    Calculates parameters for Lean Attention (num CTAs, num_m_blocks, num_n_blocks, etc.))
+    """
+    ##### Lean Attention: Calculate Splits and Tile Sizes #####
     ## based on onnxruntime/contrib_ops/cuda/bert/lean_attention
     num_m_blocks = (max_seqlen_q + BLOCK_M - 1) // BLOCK_M
     num_n_blocks = (max_seqlen_k + BLOCK_N - 1) // BLOCK_N
@@ -211,7 +309,13 @@ def get_num_splits_and_buffer_sizes(
     # StreamK Lean has as many threadblocks as SMs
     # This should be a function of tile size and number of scratchpad space
     # LeanAttention assign 3 CTAs per SM (bounded by LDS size)
-    lean_griddimz = num_SMs  # CTA launch grid
+    if total_tiles <= num_SMs:
+        lean_griddimz = min(
+            (total_tiles + 1) // 2,
+            (32 * total_tiles + num_n_blocks - 1) // num_n_blocks,
+        )
+    else:
+        lean_griddimz = num_SMs  # CTA launch grid
     # if (total_tiles <= 2 * 2 * num_SMs):
     #    lean_griddimz = min((total_tiles + 1) / 2, (32 * total_tiles + num_n_blocks - 1) / num_n_blocks)
     # else:
@@ -250,41 +354,232 @@ def get_num_splits_and_buffer_sizes(
     )
 
 
-@triton.jit
-def find_group(x, MASKED_BLOCKS: tl.constexpr, num_m_blocks: tl.constexpr):
-    total_blocks_processed = 0
-    final_q_block_idx = 0
-    final_task_size = 0
-    final_total_blocks = 0
-    found = False
-    # Iterate through the tasks in the desired ping-pong order
-    for i in range(0, num_m_blocks):
-        # Determine the actual Q block index for the current task in the ping-pong sequence
-        pair_idx = i // 2
-        if (i % 2) == 0:
-            # Even tasks are from the top (e.g., 0, 1, 2...)
-            q_block_idx = pair_idx
+def calculate_max_output_tiles_analytically(
+    tiles_per_head: int,
+    num_m_blocks: int,
+    num_wgs: int,
+    high_load_wgs: int,
+    max_tiles_per_wg: int,
+    causal: bool,
+    MASKED_BLOCKS: int,
+    MODE: int,  # 0-ping-pong, 1-sequential
+):
+    """
+    Calculates the maximum number of output tiles any single workgroup will process
+    using a fast, analytical method with binary search.
+    """
+    if num_wgs == 0:
+        return 0
+
+    m_block_boundaries = []
+    if causal:
+        # Pre-compute the boundaries of each M-block's workload for a single head.
+        # This list will be used for binary searches.
+        total_blocks = 0
+        for i in range(num_m_blocks):
+            if MODE == 0:
+                pair_idx = i // 2
+                q_block_idx = pair_idx if (i % 2) == 0 else num_m_blocks - 1 - pair_idx
+            else:
+                q_block_idx = i  # sequential
+            task_size = (q_block_idx + 1) * MASKED_BLOCKS
+            total_blocks += task_size
+            m_block_boundaries.append(total_blocks)
+
+    max_total_output_tiles = 0
+    # Loop through each workgroup to find the one that spans the most output tiles.
+    for wg_id in range(num_wgs):
+        total_output_tiles_for_wg = 0
+
+        # Determine the range of global lean tile indices for this WG
+        if wg_id < high_load_wgs:
+            start_iter = max_tiles_per_wg * wg_id
+            end_iter = start_iter + max_tiles_per_wg
         else:
-            # Odd tasks are from the bottom (e.g., N-1, N-2, ...)
-            q_block_idx = num_m_blocks - 1 - pair_idx
+            start_iter = (max_tiles_per_wg - 1) * (
+                wg_id - high_load_wgs
+            ) + high_load_wgs * max_tiles_per_wg
+            end_iter = start_iter + (max_tiles_per_wg - 1)
 
-        # Calculate the size of this task's workload (number of K/V blocks to process)
-        task_size = (q_block_idx + 1) * MASKED_BLOCKS
+        start_head = start_iter // tiles_per_head
+        end_head = (end_iter - 1) // tiles_per_head
 
-        # Check if the global tile `x` falls within this task's range
-        if total_blocks_processed + task_size > x and not found:
-            # We found it. Return the Q index, the size of its workload, and its starting tile.
-            final_q_block_idx, final_task_size, final_total_blocks = (
-                q_block_idx,
-                task_size,
-                total_blocks_processed,
-            )
-            found = True
+        # Loop through each head this workgroup touches
+        for head_idx in range(start_head, end_head + 1):
+            head_start_iter = head_idx * tiles_per_head
 
-        # Add this task's size to the running total and move to the next
-        total_blocks_processed += task_size
-    # Return values
+            # Find the intersection of the WG's range and the current head's range
+            wg_start_in_head = max(start_iter, head_start_iter)
+            wg_end_in_head = min(end_iter, head_start_iter + tiles_per_head)
+
+            if not causal:
+                # For non-causal, each head is one output tile.
+                total_output_tiles_for_wg += 1
+                continue
+
+            # --- Causal Logic using Binary Search ---
+            # Convert to indices relative to the start of the head's workload
+            relative_start = wg_start_in_head - head_start_iter
+            relative_end = wg_end_in_head - head_start_iter
+
+            # Use binary search to find which M-block the start and end tiles fall into
+            start_m_idx = bisect_right(m_block_boundaries, relative_start)
+            end_m_idx = bisect_right(m_block_boundaries, relative_end - 1)
+
+            # The number of output tiles is the number of boundaries crossed
+            tiles_in_this_head = (end_m_idx - start_m_idx) + 1
+            total_output_tiles_for_wg += tiles_in_this_head
+
+        max_total_output_tiles = max(max_total_output_tiles, total_output_tiles_for_wg)
+
+    return max_total_output_tiles
+
+
+@triton.jit
+def find_group_sequential(x, MASKED_BLOCKS: tl.constexpr, num_m_blocks: tl.constexpr):
+    i = tl.arange(0, num_m_blocks)
+    q_block_idx = i  # Group indices: 0, 1, 2, ...
+
+    task_size = (q_block_idx + 1) * MASKED_BLOCKS
+    cumulative = tl.cumsum(task_size) - task_size
+    mask = cumulative + task_size > x
+
+    # Find only the first True occurrence in mask.
+    mask_int = mask.to(tl.int32)
+    prefix_sum = tl.cumsum(mask_int)
+    one_hot = mask & (prefix_sum == 1)
+
+    # Handle case where no group is found (e.g., x is out of range)
+    found = tl.sum(one_hot)
+    sentinel = -1
+
+    final_q_block_idx = tl.where(found > 0, tl.sum(q_block_idx * one_hot), sentinel)
+    final_task_size = tl.where(found > 0, tl.sum(task_size * one_hot), 0)
+    final_total_blocks = tl.where(found > 0, tl.sum(cumulative * one_hot), 0)
+
     return final_q_block_idx, final_task_size, final_total_blocks
+
+
+@triton.jit
+def find_group_pingpong(x, MASKED_BLOCKS: tl.constexpr, num_m_blocks: tl.constexpr):
+    i = tl.arange(0, num_m_blocks)
+    pair_idx = i // 2
+    q_block_idx = tl.where(i % 2 == 0, pair_idx, num_m_blocks - 1 - pair_idx)
+    task_size = (q_block_idx + 1) * MASKED_BLOCKS
+    cumulative = tl.cumsum(task_size) - task_size
+    mask = cumulative + task_size > x
+
+    # Use cumsum to construct a one-hot for the first True
+    mask_int = mask.to(tl.int32)
+    prefix_sum = tl.cumsum(mask_int)
+    one_hot = mask & (prefix_sum == 1)
+
+    final_q_block_idx = tl.sum(q_block_idx * one_hot)
+    final_task_size = tl.sum(task_size * one_hot)
+    final_total_blocks = tl.sum(cumulative * one_hot)
+
+    return final_q_block_idx, final_task_size, final_total_blocks
+
+
+@triton.jit
+def _attention_inner(
+    q,
+    k_ptrs,
+    v_ptrs,
+    stride_vn,
+    stride_kn,
+    m_i,
+    l_i,
+    acc,
+    qk_scale,
+    causal,
+    q_start_m,
+    b_seq_size,
+    offs_m,
+    offs_n,
+    BLOCK_M,
+    BLOCK_N,
+    HEAD_DIM,
+    local_iter,
+    local_iter_end,
+):
+    """
+    Performs attention calculation for an (maybe partial) output tile
+    """
+    for l_iter in range(local_iter, local_iter_end):
+        k = tl.load(k_ptrs)
+        qk = tl.dot(q, k) * qk_scale
+
+        if causal:
+            # Get the starting column index of the current K block
+            k_start_n = (b_seq_size + l_iter) * BLOCK_N
+            # Create mask based on absolute sequence positions
+            mask = (q_start_m + offs_m[:, None]) >= (k_start_n + offs_n[None, :])
+            # Apply the mask
+            qk = tl.where(mask, qk, float("-inf"))
+
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+
+        if causal:
+            # Safe exp2 calculation to avoid NaNs
+            p_arg = qk - m_ij[:, None]
+            p_arg = tl.where(m_ij[:, None] == float("-inf"), float("-inf"), p_arg)
+            p = tl.math.exp2(p_arg)
+
+            # Safe scaling factor calculation
+            alpha_arg = m_i - m_ij
+            alpha_arg = tl.where(m_ij == float("-inf"), 0.0, alpha_arg)
+            alpha = tl.math.exp2(alpha_arg)
+        else:
+            qk = qk - m_ij[:, None]
+            p = tl.math.exp2(qk)  # p.shape = [BLOCK_M, BLOCK_N]
+            alpha = tl.math.exp2(m_i - m_ij)
+
+        # Update accumulator
+        acc = acc * alpha[:, None]
+        v = tl.load(v_ptrs)
+        acc += tl.dot(p.to(v.dtype), v)
+
+        # Update stats
+        l_ij = tl.sum(p, 1)
+        l_i = l_i * alpha + l_ij
+        m_i = m_ij.to(m_i.dtype)
+
+        # update k/v pointer
+        v_ptrs += BLOCK_N * stride_vn
+        k_ptrs += BLOCK_N * stride_kn
+
+    return m_i, l_i, acc
+
+
+@triton.jit
+def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr = 8):
+    ## pid remapping on xcds
+    # Number of pids per XCD in the new arrangement
+    pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
+    # When GRID_MN cannot divide NUM_XCDS, some xcds will have
+    # pids_per_xcd pids, the other will have pids_per_xcd - 1 pids.
+    # We calculate the number of xcds that have pids_per_xcd pids as
+    # tall_xcds
+    tall_xcds = GRID_MN % NUM_XCDS
+    tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
+    # Compute current XCD and local pid within the XCD
+    xcd = pid % NUM_XCDS
+    local_pid = pid // NUM_XCDS
+    # Calculate new pid based on the new grouping
+    # Note that we need to consider the following two cases:
+    # 1. the current pid is on a tall xcd
+    # 2. the current pid is on a short xcd
+    if xcd < tall_xcds:
+        pid = xcd * pids_per_xcd + local_pid
+    else:
+        pid = (
+            tall_xcds * pids_per_xcd
+            + (xcd - tall_xcds) * (pids_per_xcd - 1)
+            + local_pid
+        )
+
+    return pid
 
 
 @triton.jit
@@ -324,6 +619,7 @@ def la_persistent(
     causal: tl.constexpr,
     num_m_blocks: tl.constexpr,
     num_n_blocks: tl.constexpr,
+    total_programs: tl.constexpr,
     # leanAttention params
     high_load_wgs: tl.constexpr,
     max_tiles_per_wg: tl.constexpr,
@@ -335,6 +631,8 @@ def la_persistent(
         current_pid = pod_pid
     else:
         current_pid = tl.program_id(0)
+
+    current_pid = remap_xcd(current_pid, GRID_MN=total_programs, NUM_XCDS=8)
 
     if current_pid < high_load_wgs:
         iter = max_tiles_per_wg * current_pid
@@ -481,13 +779,23 @@ def la_persistent_inner(
         # Does not support ragged batching. All requests in the batch have the same context length (per_head_tile_size)
         # tiles_per_head: total sum of # BLOCK_N in K/V sequence of all batches
         # per_head_tile_size: per head # BLOCK_N of each output tile
-        per_head_tile_idx, per_head_tile_size, total_blocks = find_group(
+
+        per_head_tile_idx, per_head_tile_size, total_blocks = find_group_pingpong(
             iter
             - (tile_head_idx * tiles_per_head)
             - (tile_batch_idx * (tiles_per_head // batch_size)),
             MASKED_BLOCKS,
             num_m_blocks,
         )
+        """
+        per_head_tile_idx, per_head_tile_size, total_blocks = find_group_sequential(
+            iter
+            - (tile_head_idx * tiles_per_head)
+            - (tile_batch_idx * (tiles_per_head // batch_size)),
+            MASKED_BLOCKS,
+            num_m_blocks,
+        )
+        """
         tile_iter = (
             tile_head_idx * tiles_per_head
             + (tile_batch_idx * (tiles_per_head // batch_size))
@@ -563,8 +871,11 @@ def la_persistent_inner(
 
     if causal:
         q_idx = per_head_tile_idx + tile_batch_idx * num_m_blocks
+        q_start_m = q_idx * BLOCK_M
     else:
         q_idx = tile_batch_idx
+        q_start_m = 0
+
     q_offs = (
         q_idx * BLOCK_M * stride_qm
         + tile_head_idx * stride_qh
@@ -574,62 +885,33 @@ def la_persistent_inner(
     q_ptrs = Q + q_offs
     q_ptrs = tl.multiple_of(q_ptrs, (1, 16))
 
-    if causal:
-        q_start_m = q_idx * BLOCK_M
-
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
     q = tl.load(q_ptrs)
 
-    for l_iter in range(local_iter, local_iter_end):
-        # -- compute qk ----
-        # k = tl.load(k_ptrs, cache_modifier=".cg")
-        k = tl.load(k_ptrs)
-        qk = tl.dot(q, k)
-        qk = qk * qk_scale
-
-        # Apply the causal mask
-        #    qk = tl.where(mask, qk, float("-inf"))
-
-        if causal:
-            # Get the starting column index of the current K block
-            k_start_n = (b_seq_size + l_iter) * BLOCK_N
-            # Create mask based on absolute sequence positions
-            mask = (q_start_m + offs_m[:, None]) >= (k_start_n + offs_n[None, :])
-            # Apply the mask
-            qk = tl.where(mask, qk, float("-inf"))
-
-        m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        qk = qk - m_ij[:, None]
-        p = tl.math.exp2(qk)  # p.shape = [BLOCK_M, BLOCK_N]
-        # -- update output accumulator --
-        alpha = tl.math.exp2(m_i - m_ij)
-        acc = (
-            acc * alpha[:, None]
-        )  # Scale each row of acc by the corresponding elements in alpha
-        # v = tl.load(v_ptrs, cache_modifier=".cg")  # v.shape = [BLOCK_N, HEAD_DIM]
-        v = tl.load(v_ptrs)
-        acc += tl.dot(p.to(v.dtype), v)  # acc.shape = [BLOCK_M, HEAD_DIM]
-        # -- update l_i
-        l_ij = tl.sum(p, 1)  # rowsum(p)
-        l_i = l_i * alpha + l_ij
-        # update m_i
-        m_i = m_ij.to(m_i.dtype)
-        if (
-            (l_iter == (tile_iter_end - tile_iter) - 1)
-            and (iter == tile_iter_end - 1)
-            and (MASKED_BLOCKS == 2)
-        ):
-            mask1 = offs_m >= BLOCK_N
-            m_i = tl.where(mask1, m_i, float("-inf"))
-            l_i = tl.where(mask1, l_i, 1.0)
-            mask1 = mask1[:, None]
-            acc = tl.where(mask1, acc, 0.0)
-        # update k/v pointer
-        v_ptrs += BLOCK_N * stride_vn
-        k_ptrs += BLOCK_N * stride_kn
+    m_i, l_i, acc = _attention_inner(
+        q,
+        k_ptrs,
+        v_ptrs,
+        stride_vn,
+        stride_kn,
+        m_i,
+        l_i,
+        acc,
+        qk_scale,
+        causal,
+        q_start_m,
+        b_seq_size,
+        offs_m,
+        offs_n,
+        BLOCK_M,
+        BLOCK_N,
+        HEAD_DIM,
+        local_iter,
+        local_iter_end,
+    )
 
     # initialize pointer to m and l
     m_cta = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
@@ -652,10 +934,10 @@ def la_persistent_inner(
         tl.store(lp_ptrs, l_i, cache_modifier=".wt")
         tl.store(op_ptrs, acc, cache_modifier=".wt")
         tl.debug_barrier()
-        # tl.store(locks + current_pid, 1, cache_modifier=".wt")
+        tl.store(locks + current_pid, 1, cache_modifier=".wt")
         # According to streamK gemm, store + cache_modifier won't work universally
         # atomic_xchg is better solution but a less performant variant
-        tl.atomic_xchg(locks + current_pid, 1)
+        # tl.atomic_xchg(locks + current_pid, 1)
 
     if host_block:  # and finishing_block:
         # A host block that is also a finishing block completes all the LeanTile iterations for its output tile
@@ -695,10 +977,9 @@ def la_persistent_inner(
             # Next, load nonHost partial restult
             for cta in range((current_pid + 1), last_cta):
                 # According to treamK gemm, atomic_cas is universal solution but less performant
-                while tl.atomic_cas(locks + cta, 1, 1) != 1:
-                    # while tl.load(locks + cta, cache_modifier=".cv", volatile=True) != 1:
+                # while tl.atomic_cas(locks + cta, 1, 1) != 1:
+                while tl.load(locks + cta, cache_modifier=".cv", volatile=True) != 1:
                     pass
-
                 # Partial results are stored in [nonHost, Host-nonFinishing] layout
                 offs_mplp = cta * BLOCK_M + offs_m
                 mp_ptrs = Mp + offs_mplp
@@ -725,11 +1006,15 @@ def la_persistent_inner(
                     * stride_opn
                 )
 
-                m_cta = tl.load(mp_ptrs)
-                l_cta = tl.load(lp_ptrs)
+                m_cta = tl.load(mp_ptrs, cache_modifier=".cv")
+                l_cta = tl.load(lp_ptrs, cache_modifier=".cv")
                 # acc_cta = tl.load(op_ptrs)
-                acc_cta0 = tl.load(op_ptrs0)
-                acc_cta1 = tl.load(op_ptrs1)
+                acc_cta0 = tl.load(
+                    tl.multiple_of(op_ptrs0, (1, 16)), cache_modifier=".cv"
+                )
+                acc_cta1 = tl.load(
+                    tl.multiple_of(op_ptrs1, (1, 16)), cache_modifier=".cv"
+                )
 
                 # m_i is the host CTA's m, m_cta is other nonHost CTA's m
                 m_new = tl.maximum(m_cta, m_i)
