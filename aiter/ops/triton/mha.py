@@ -23,6 +23,82 @@ _LOGGER = AiterTritonLogger()
 global _USE_FUSED_BWD_KERNEL
 _USE_FUSED_BWD_KERNEL = False
 
+# Tessera ---------------------------------------------------------------------------------------------------
+
+@triton.jit
+def chiplet_transform_chunk(index, num_workgroups, chunk_size: tl.constexpr, num_xcds: tl.constexpr):
+    """
+    Triton kernel helper mirroring tessera::chiplet_transform_chunk.
+    """
+    effective_chunk = tl.minimum(chunk_size, num_workgroups // num_xcds)
+    xcd = index % num_xcds
+    limit = (num_workgroups // (num_xcds * effective_chunk)) * (num_xcds * effective_chunk)
+    transformed_index = tl.where(
+        index > limit,
+        index,
+        (index // num_xcds // effective_chunk) * (num_xcds * effective_chunk)
+        + xcd * effective_chunk
+        + (index // num_xcds) % effective_chunk,
+    )
+    return transformed_index
+
+@triton.jit
+def _compute_level_index_3d(index, x_radix, y_radix, z_radix, order: tl.constexpr, cumulative_denominator):
+    """
+    Decode the coordinate for a single radix level in 3D and advance the cumulative denominator.
+
+    Args:
+        index: flat index
+        x_radix: size in x dimension (fastest-changing for row-major)
+        y_radix: size in y dimension (middle for row-major)
+        z_radix: size in z dimension (slowest-changing for row-major)
+        order: ROW_MAJOR or COLUMN_MAJOR
+        cumulative_denominator: product of all radices processed so far
+    Returns:
+        level_x_idx, level_y_idx, level_z_idx, new_cumulative_denominator
+    """
+    # Decode colexicographically with the appropriate order.
+    if order == 0:
+        # ROW_MAJOR: x varies fastest, then y, then z
+        level_x_idx = (index // cumulative_denominator) % x_radix
+        cumulative_denominator = cumulative_denominator * x_radix
+        level_y_idx = (index // cumulative_denominator) % y_radix
+        cumulative_denominator = cumulative_denominator * y_radix
+        level_z_idx = (index // cumulative_denominator) % z_radix
+        cumulative_denominator = cumulative_denominator * z_radix
+    else:
+        # COLUMN_MAJOR: z varies fastest, then y, then x
+        level_z_idx = (index // cumulative_denominator) % z_radix
+        cumulative_denominator = cumulative_denominator * z_radix
+        level_y_idx = (index // cumulative_denominator) % y_radix
+        cumulative_denominator = cumulative_denominator * y_radix
+        level_x_idx = (index // cumulative_denominator) % x_radix
+        cumulative_denominator = cumulative_denominator * x_radix
+
+    return level_x_idx, level_y_idx, level_z_idx, cumulative_denominator
+
+@triton.jit
+def layout_depth1_3d(index, dim_z, dim_y, dim_x, ordering: tl.constexpr):
+    """
+    Single-level 3D layout mapping.
+    
+    Args:
+        index: flat index to decode
+        dim_z: depth dimension
+        dim_y: height dimension
+        dim_x: width dimension
+        ordering: ROW_MAJOR or COLUMN_MAJOR
+    Returns:
+        1D row-major index in the 3D grid
+    """
+    cumulative_denominator = 1
+    x_idx, y_idx, z_idx, _ = _compute_level_index_3d(index, dim_x, dim_y, dim_z, ordering, cumulative_denominator)
+    return _row_major_index_3d(x_idx, y_idx, z_idx, dim_x, dim_y)
+
+# Tessera ---------------------------------------------------------------------------------------------------
+
+
+
 
 def mha_set_use_fused_bwd_kernel(value: bool):
     global _USE_FUSED_BWD_KERNEL
@@ -431,6 +507,7 @@ def _attn_fwd(
         0
     )  # workgroup id ranging: 0,1,2,...., (BATCH * NUM_Q_HEADS * NUM_BLOCKS - 1)
     # num blocks along seqlen
+    wid = chiplet_transform_chunk(wid, BATCH * NUM_Q_HEADS * NUM_BLOCKS, NUM_BLOCKS, NUM_XCD)
 
     chunk_size = (
         NUM_XCD * NUM_BLOCKS
@@ -446,13 +523,20 @@ def _attn_fwd(
     else:
         # swizzling wids via Head-first Mapping
         # first element indexes starting head for each XCD, second element adds 1 for every next head on the same XCD
-        off_q_head = (wid_per_batch % NUM_XCD) * q_heads_per_xcd + (
-            wid_per_batch // chunk_size
-        )
-        # continuous block ids for the q_head mapped to the same xcd
-        start_m = (wid_per_batch % chunk_size) // NUM_XCD
+        # Head Index
+        # off_q_head = (wid_per_batch % NUM_XCD) * q_heads_per_xcd + (
+        #     wid_per_batch // chunk_size
+        # )
+        # # continuous block ids for the q_head mapped to the same xcd
+        # # Block Index.
+        # start_m = (wid_per_batch % chunk_size) // NUM_XCD
+        start_m = wid % NUM_BLOCKS
+        wid_tmp = wid // NUM_BLOCKS
+        off_q_head = wid_tmp % NUM_Q_HEADS
+        off_z = wid_tmp // NUM_Q_HEADS
 
-    off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
+
+    # off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH # Batch index
 
     # offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
